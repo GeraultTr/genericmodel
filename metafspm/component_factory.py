@@ -1,5 +1,6 @@
 import inspect as ins
 from functools import partial
+import multiprocessing as mp
 
 
 # General process resolution method
@@ -18,18 +19,18 @@ class Functor:
         arguments.remove("self")
         return arguments
 
-    def __call__(self, instance, data, data_type="<class 'dict'>", *args):
+    def __call__(self, chunk=[], *args):
         if self.iterating:
-            self.fun(instance)
-        elif data_type == "<class 'dict'>":
+            self.fun(self.instance)
+        elif self.data_type == "<class 'dict'>":
             if self.total:
-                data[self.name].update(
-                    {1: self.fun(instance, *(getattr(instance, arg) for arg in self.input_names))})
+                self.data[self.name].update(
+                    {1: self.fun(self.instance, *(getattr(self.instance, arg) for arg in self.input_names))})
             else:
-                data[self.name].update(
-                    {vid: self.fun(instance, *(getattr(instance, arg)[vid] for arg in self.input_names)) for vid in data["focus_elements"]})
-        elif data_type == "<class 'numpy.ndarray'>":
-            data[self.name] = self.fun(instance, *(data[arg] for arg in self.input_names))
+                return {vid: self.fun(self.instance, *(getattr(self.instance, arg)[vid] for arg in self.input_names)) for vid in chunk}
+            
+        elif self.data_type == "<class 'numpy.ndarray'>":
+            self.data[self.name] = self.fun(self.instance, *(self.data[arg] for arg in self.input_names))
 
 # Executor singleton
 class Singleton(object):
@@ -63,6 +64,8 @@ class Choregrapher(Singleton):
     """
 
     scheduled_groups = {}
+    iterating_group = {}
+    vid_chunks = [[]]
     sub_time_step = {}
     data_structure = {"soil":None, "root":None}
     filter =  {"label": ["Segment", "Apex"], "type":["Base_of_the_root_system", "Normal_root_after_emergence", "Stopped", "Just_Stopped", "Root_nodule"]}
@@ -79,10 +82,14 @@ class Choregrapher(Singleton):
         self.sub_time_step[module_family] = sub_time_step
         if self.data_structure[compartment] == None:
             self.data_structure[compartment] = data
+            if compartment == "root":
+                self.data_structure[compartment]["focus_elements"] = []
         data_structure_type = str(type(list(self.data_structure[compartment].values())[0]))
         for k in self.scheduled_groups[module_family].keys():
-            for f in range(len(self.scheduled_groups[module_family][k])):
-                self.scheduled_groups[module_family][k][f] = partial(self.scheduled_groups[module_family][k][f], *(instance, self.data_structure[compartment], data_structure_type))
+            for f_name in self.scheduled_groups[module_family][k].keys():
+                self.scheduled_groups[module_family][k][f_name].instance = instance 
+                self.scheduled_groups[module_family][k][f_name].data = self.data_structure[compartment]
+                self.scheduled_groups[module_family][k][f_name].data_type = data_structure_type
 
     def add_simulation_time_step(self, simulation_time_step: int):
         """
@@ -130,6 +137,7 @@ class Choregrapher(Singleton):
 
     def build_schedule(self, module_family):
         self.scheduled_groups[module_family] = {}
+        self.iterating_group[module_family] = {}
         # As functors can belong two multiple categories, we store unique names to avoid duplicated instances
         unique_functors = {}
         for attribute in dir(self):
@@ -152,23 +160,48 @@ class Choregrapher(Singleton):
                             
             # We append the priority tuple to she scheduled groups dictionnary
             if str(priority) not in self.scheduled_groups[module_family].keys():
-                self.scheduled_groups[module_family][str(priority)] = []
-            self.scheduled_groups[module_family][str(priority)].append(functor)
+                self.scheduled_groups[module_family][str(priority)] = {}
+                self.iterating_group[module_family][str(priority)] = not functor.iterating and not functor.total and module_family != "soil"
+            self.scheduled_groups[module_family][str(priority)][functor.name] = functor
 
         # Finally, we sort the dictionnary by key so that the call function can go through functor groups in the expected order
         self.scheduled_groups[module_family] = {k: self.scheduled_groups[module_family][k] for k in sorted(self.scheduled_groups[module_family].keys())}
 
     def __call__(self, module_family):
+        if "pool" not in dir(self):
+            self.pool = mp.Pool(mp.cpu_count()-1)
+        print(module_family)
         for increment in range(int(self.simulation_time_step/self.sub_time_step[module_family])):
             for step in self.scheduled_groups[module_family].keys():
-                for functor in self.scheduled_groups[module_family][step]:
-                    functor()
+                if self.iterating_group[module_family][step]:
+                    
+                    map_over_chunks_p = partial(map_over_chunks, self.scheduled_groups[module_family][step])
+                    results_chunks = self.pool.map(map_over_chunks_p, self.vid_chunks)
+
+                    for name in results_chunks[0].keys():
+                        for results in results_chunks:
+                            self.data_structure["root"][name].update(results[name])
+                else:
+                    for functor in self.scheduled_groups[module_family][step].values():
+                        functor(chunk=self.data_structure["root"]["focus_elements"])
 
         if module_family == "growth":
-            self.data_structure["root"]["focus_elements"] = [vid for vid in self.data_structure["root"]["struct_mass"].keys() if (
-                self.data_structure["root"]["label"][vid] in self.filter["label"] 
-                and self.data_structure["root"]["type"][vid] in self.filter["type"])]
+            for vid in self.data_structure["root"]["struct_mass"].keys():
+                if (self.data_structure["root"]["label"][vid] in self.filter["label"] 
+                    and self.data_structure["root"]["type"][vid] in self.filter["type"]
+                    and vid not in self.data_structure["root"]["focus_elements"]):
+                    self.data_structure["root"]["focus_elements"].append(vid)
 
+                    if len(self.vid_chunks[-1]) == 100:
+                        self.vid_chunks += [[]]
+                    self.vid_chunks[-1].append(vid)
+
+
+def map_over_chunks(dict_of_functions, chunk):
+        results = {}
+        for f_name, functor in dict_of_functions.items():
+            results[f_name] = functor(chunk)
+        return results
 
 # Decorators    
 def priorbalance(func):
